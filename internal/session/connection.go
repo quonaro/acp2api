@@ -183,8 +183,9 @@ func (c *connection) byID(sessionID string) *state {
 //
 // The bool reports whether it was created, which is what tells the caller the
 // agent holds no history yet and the transcript has to be replayed.
-func (c *connection) session(ctx context.Context, conversationID, model string) (*state, bool, error) {
+func (c *connection) session(ctx context.Context, conversationID, model, effort string) (*state, bool, error) {
 	if st := c.lookup(conversationID); st != nil {
+		c.warnEffortOnLiveSession(conversationID, st, model, effort)
 		return st, false, nil
 	}
 
@@ -193,10 +194,11 @@ func (c *connection) session(ctx context.Context, conversationID, model string) 
 
 	// Re-check: another goroutine may have created it while we waited.
 	if st := c.lookup(conversationID); st != nil {
+		c.warnEffortOnLiveSession(conversationID, st, model, effort)
 		return st, false, nil
 	}
 
-	st, err := c.newSession(ctx, model)
+	st, err := c.newSession(ctx, model, effort)
 	if err != nil {
 		return nil, false, err
 	}
@@ -219,6 +221,32 @@ func (c *connection) session(ctx context.Context, conversationID, model string) 
 	return st, true, nil
 }
 
+// warnEffortOnLiveSession reports an effort a live session cannot honour.
+//
+// A session is created once and keeps its model for its whole life: ACP has no
+// way to re-select a variant without disturbing the conversation, and turning
+// an existing session into a new one would throw its history away. The effort
+// is therefore dropped — which is exactly the kind of silent no-op this gateway
+// refuses elsewhere, so it is named in the log rather than left to be inferred
+// from a model name the caller cannot see.
+//
+// It stays a warning rather than an error because the turn itself is still the
+// one the caller asked for; only the level is not.
+func (c *connection) warnEffortOnLiveSession(conversationID string, st *state, model, effort string) {
+	if effort == "" {
+		return
+	}
+	attrs := []any{
+		"agent", c.agent.ID, "session", st.id, "model", model, "reasoning_effort", effort,
+	}
+	if conversationID != "" {
+		attrs = append(attrs, "conversation", conversationID)
+	}
+	slog.With("module", "session").Warn(
+		"reasoning_effort applies only when a session is created; the existing session keeps its model",
+		attrs...)
+}
+
 // lookup returns an existing session for a conversation, touching it.
 func (c *connection) lookup(conversationID string) *state {
 	if conversationID == "" {
@@ -235,7 +263,7 @@ func (c *connection) lookup(conversationID string) *state {
 }
 
 // newSession opens one ACP session and its client-side handler.
-func (c *connection) newSession(ctx context.Context, model string) (*state, error) {
+func (c *connection) newSession(ctx context.Context, model, effort string) (*state, error) {
 	raw, err := c.client.Request(ctx, acp.MethodSessionNew, acp.NewSessionRequest{
 		Cwd:        c.workspace,
 		McpServers: []acp.McpServer{},
@@ -270,8 +298,16 @@ func (c *connection) newSession(ctx context.Context, model string) (*state, erro
 	if err := c.applyMode(ctx, res); err != nil {
 		return nil, err
 	}
+	if effort != "" && model == "" {
+		// An effort with no family cannot pick a variant: "agent" alone means
+		// the default, and guessing a family would silently answer through the
+		// wrong model.
+		return nil, fmt.Errorf(
+			"session: reasoning_effort %q needs a model family; send the model as %q",
+			effort, c.agent.ID+"/<model>")
+	}
 	if model != "" {
-		if err := c.selectModel(ctx, res.SessionID, model); err != nil {
+		if err := c.selectModel(ctx, res.SessionID, model, effort); err != nil {
 			return nil, err
 		}
 	}
